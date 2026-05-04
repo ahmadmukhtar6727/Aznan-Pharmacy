@@ -1,0 +1,427 @@
+import streamlit as st
+import sqlite3
+import pandas as pd
+import json
+from datetime import datetime, timedelta
+
+# --- 1. INITIAL SETUP ---
+st.set_page_config(page_title="Aznan Pharmacy Monitor", layout="wide")
+
+from fpdf import FPDF
+import os
+
+class AznanReceipt(FPDF):
+    def header(self):
+        # CENTERED VERY SMALL LOGO (15mm width)
+        if os.path.exists("logo.png"):
+            # x=32.5 centers a 15mm image on 80mm paper
+            self.image("logo.png", x=32.5, y=4, w=15) 
+        
+        self.set_font('Arial', 'B', 12)
+        self.ln(18) # Space after the small logo
+        self.cell(0, 5, 'AZNAN PHARMACY', 0, 1, 'C')
+        self.set_font('Arial', '', 7)
+        self.cell(0, 4, 'IBB Way, Bakin Kasuwa, Opposite Eye Center, Katsina, Katsina State', 0, 1, 'C')
+        self.cell(0, 4, '08167899122 | 07039522767 | 08102716591', 0, 1, 'C')
+        self.ln(5)
+
+def create_pdf_receipt(cart, total, cashier, customer="Walk-in"):
+    pdf = AznanReceipt(format=(80, 300))
+    pdf.add_page()
+    pdf.set_font("Arial", size=8)
+    pdf.cell(0, 4, f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=1)
+    pdf.cell(0, 4, f"Cashier: {cashier}", ln=1)
+    pdf.cell(0, 4, f"Customer: {customer}", ln=1)
+    pdf.ln(2)
+    
+    # Header
+    pdf.set_font("Arial", 'B', 8)
+    pdf.cell(35, 5, "Item", 1); pdf.cell(10, 5, "Qty", 1); pdf.cell(15, 5, "Total", 1, ln=1)
+    
+    # Items
+    pdf.set_font("Arial", size=7)
+    for item in cart:
+        pdf.cell(35, 5, item['name'][:18], 1)
+        pdf.cell(10, 5, str(item['qty']), 1)
+        pdf.cell(15, 5, f"{item['subtotal']:.1f}", 1, ln=1)
+    
+    pdf.ln(2)
+    pdf.set_font("Arial", 'B', 10)
+    pdf.cell(0, 6, f"TOTAL: N{total:,.2f}", 0, 1, 'R')
+    pdf.set_font("Arial", 'I', 7)
+    pdf.ln(2)
+    pdf.cell(0, 5, "THANK YOU FOR YOUR PATRONAGE (MUNGODE)", 0, 1, 'C')
+    
+    file_path = "receipt.pdf"
+    pdf.output(file_path)
+    return file_path
+
+# This creates the database tables if they don't exist
+def init_db():
+    conn = sqlite3.connect('aznan_step_by_step.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS inventory 
+                 (id INTEGER PRIMARY KEY, item_name TEXT UNIQUE, stock_qty INTEGER, unit TEXT, 
+                  cost_price REAL, retail_price REAL, wholesale_price REAL, expiry_date TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS sales 
+                 (id INTEGER PRIMARY KEY, items_json TEXT, total_revenue REAL, 
+                  total_profit REAL, discount REAL, date TEXT, status TEXT, cashier TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS debts 
+                 (id INTEGER PRIMARY KEY, customer_name TEXT, amount_owed REAL, 
+                  amount_paid REAL DEFAULT 0.0, date TEXT, status TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS expenses 
+                 (id INTEGER PRIMARY KEY, category TEXT, amount REAL, date TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- 2. LOGIN SYSTEM (Centered Version) ---
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+
+if not st.session_state.logged_in:
+    # This creates 3 columns. The [1, 2, 1] means the middle one is twice as wide
+    # Adjusting these numbers changes the width of the login box
+    left_co, cent_co, last_co = st.columns([1, 1, 1]) 
+
+    with cent_co: # Everything inside this 'with' will be in the center
+        st.title("🔐 Aznan Login")
+        st.markdown("---")
+        
+        user = st.text_input("Username")
+        pw = st.text_input("Password", type="password")
+        
+        if st.button("Login", use_container_width=True): # Makes button fit the box
+            if user == "Ammar Abdulkadir" and pw == "Aznan@2026":
+                st.session_state.logged_in, st.session_state.username = True, "Ammar"
+                st.rerun()
+            elif user == "Walid Mukhtar" and pw == "12@34":
+                st.session_state.logged_in, st.session_state.username = True, "Walid"
+                st.rerun()
+            else: 
+                st.error("Invalid credentials")
+    st.stop()
+# --- 3. MULTI-PAGE NAVIGATION (The Sidebar) ---
+# --- 3. SMART NAVIGATION (Updated with Expenses) ---
+st.sidebar.title("AZNAN PHARMACY")
+st.sidebar.write(f"Logged in as: **{st.session_state.username}**")
+
+if st.session_state.username == "Walid":
+    menu = ["🛒 Sales Outlet", "📋 Inventory"]
+else:
+    # Ammar (Admin) sees everything including Expenses
+    menu = ["📊 Dashboard", "🛒 Sales Outlet", "📦 Stock Addition", "📋 Inventory", "💸 Expenses", "📉 Debt Tracker", "📅 Reports"]
+
+choice = st.sidebar.selectbox("Go to Page:", menu)
+
+st.sidebar.markdown("---")
+if st.sidebar.button("🚪 Log Out"):
+    st.session_state.logged_in = False
+    st.session_state.username = None
+    st.rerun()
+
+# --- 4. THE PAGES (We will fill these one by one) ---
+
+if choice == "📊 Dashboard":
+    st.header("📊 Business Analytics")
+    conn = sqlite3.connect('aznan_step_by_step.db')
+    today = datetime.now().strftime('%Y-%m-%d')
+    
+    # 1. Fetch Financial Data
+    # Revenue/Profit only from 'Paid' sales. Revenue also includes Debt collected today.
+    sales_data = pd.read_sql(f"SELECT SUM(total_revenue) as rev, SUM(total_profit) as prof FROM sales WHERE date = '{today}' AND status = 'Paid'", conn)
+    exp_data = pd.read_sql(f"SELECT SUM(amount) as total FROM expenses WHERE date = '{today}'", conn)
+    debt_paid_today = pd.read_sql(f"SELECT SUM(amount_paid) as total FROM debts WHERE date = '{today}'", conn)
+    debt_owed_total = pd.read_sql(f"SELECT SUM(amount_owed - amount_paid) as remaining FROM debts WHERE status = 'Unpaid'", conn)
+
+    # 2. Financial Calculations
+    # Revenue = Today's Cash Sales + Today's Debt Payments
+    rev = (sales_data['rev'].iloc[0] or 0.0) + (debt_paid_today['total'].iloc[0] or 0.0)
+    gross_prof = (sales_data['prof'].iloc[0] or 0.0)
+    total_exp = exp_data['total'].iloc[0] or 0.0
+    net_prof = gross_prof - total_exp
+    collected_debt = debt_paid_today['total'].iloc[0] or 0.0
+    unpaid_debt = debt_owed_total['remaining'].iloc[0] or 0.0
+
+    # 3. Display the 6 Metrics
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Revenue (Cash)", f"₦{rev:,.2f}")
+    col2.metric("Daily Profit (Gross)", f"₦{gross_prof:,.2f}")
+    col3.metric("Net Profit", f"₦{net_prof:,.2f}")
+
+    col4, col5, col6 = st.columns(3)
+    col4.metric("Expenses Today", f"₦{total_exp:,.2f}", delta_color="inverse")
+    col5.metric("Debt Collected", f"₦{collected_debt:,.2f}")
+    col6.metric("Outstanding Debt", f"₦{unpaid_debt:,.2f}", delta_color="inverse")
+
+    st.markdown("---")
+
+    # 4. Critical Alerts Section
+    st.subheader("⚠️ Inventory Alerts")
+    inv_df = pd.read_sql("SELECT item_name, stock_qty, expiry_date FROM inventory", conn)
+    
+    a1, a2 = st.columns(2)
+    with a1:
+        # Alert: Low Stock (<= 5)
+        low_stock = inv_df[inv_df['stock_qty'] <= 5]
+        st.write(f"**Low Stock Alert ({len(low_stock)})**")
+        if not low_stock.empty:
+            st.dataframe(low_stock[['item_name', 'stock_qty']], use_container_width=True, hide_index=True)
+        else:
+            st.success("Stock levels are healthy.")
+    
+    with a2:
+        # Alert: Expiry (Next 30 days)
+        inv_df['expiry_date'] = pd.to_datetime(inv_df['expiry_date'], errors='coerce')
+        expiring_soon = inv_df[inv_df['expiry_date'] <= (datetime.now() + timedelta(days=30))]
+        st.write(f"**Expiry Alert ({len(expiring_soon)})**")
+        if not expiring_soon.empty:
+            st.dataframe(expiring_soon[['item_name', 'expiry_date']], use_container_width=True, hide_index=True)
+        else:
+            st.success("No items expiring soon.")
+    
+    conn.close()
+
+elif choice == "🛒 Sales Outlet":
+    st.header("🛒 Sales Outlet (Basket)")
+    
+    # Initialize the Basket if it doesn't exist
+    if 'basket' not in st.session_state:
+        st.session_state.basket = []
+
+    conn = sqlite3.connect('aznan_step_by_step.db')
+    # Get only items that are actually in stock
+    items_df = pd.read_sql("SELECT * FROM inventory WHERE stock_qty > 0", conn)
+    conn.close()
+
+    col_l, col_r = st.columns([1, 1.2])
+
+    with col_l:
+        st.subheader("Add to Basket")
+        search = st.selectbox("Search Drug Name", [""] + items_df['item_name'].tolist())
+        
+        if search:
+            item_row = items_df[items_df['item_name'] == search].iloc[0]
+            
+            # Wholesale/Retail Toggle
+            price_type = st.radio("Price Mode", ["Retail", "Wholesale"], horizontal=True)
+            current_price = item_row['retail_price'] if price_type == "Retail" else item_row['wholesale_price']
+            
+            st.write(f"**Available:** {item_row['stock_qty']} {item_row['unit']}")
+            st.write(f"**Unit Price:** ₦{current_price:,.2f}")
+            
+            qty = st.number_input("Quantity to Sell", 1, int(item_row['stock_qty']), 1)
+            
+            if st.button("➕ Add to Basket"):
+                # Calculate profit for this item
+                item_prof = (current_price - item_row['cost_price']) * qty
+                
+                st.session_state.basket.append({
+                    "name": search, 
+                    "qty": qty, 
+                    "price": current_price, 
+                    "subtotal": current_price * qty,
+                    "profit": item_prof
+                })
+                st.toast(f"{search} added to cart!")
+                st.rerun()
+
+    with col_r:
+        st.subheader("Current Basket")
+        if st.session_state.basket:
+            basket_df = pd.DataFrame(st.session_state.basket)
+            st.table(basket_df[['name', 'qty', 'price', 'subtotal']])
+            
+            total_bill = basket_df['subtotal'].sum()
+            total_prof = basket_df['profit'].sum()
+            
+            st.write(f"### Grand Total: ₦{total_bill:,.2f}")
+            
+            pay_status = st.selectbox("Payment Type", ["Paid", "Credit"])
+            cust = st.text_input("Customer Name", "Walk-in Customer")
+            disc = st.number_input("Overall Discount (₦)", 0.0)
+            
+            final_total = total_bill - disc
+            final_prof = total_prof - disc
+
+            if st.button("✅ Complete Transaction"):
+                conn = sqlite3.connect('aznan_step_by_step.db')
+                c = conn.cursor()
+                today = datetime.now().strftime('%Y-%m-%d')
+                
+                # Rule: Revenue is 0 if Credit (until paid in Debt Tracker)
+                s_rev = final_total if pay_status == "Paid" else 0.0
+                s_prof = final_prof if pay_status == "Paid" else 0.0
+                
+                # 1. Record the Sale
+                c.execute("""INSERT INTO sales (items_json, total_revenue, total_profit, discount, date, status, cashier) 
+                             VALUES (?,?,?,?,?,?,?)""",
+                          (json.dumps(st.session_state.basket), s_rev, s_prof, disc, today, pay_status, st.session_state.username))
+                
+                # 2. Add to Debt if Credit
+                if pay_status == "Credit":
+                    c.execute("INSERT INTO debts (customer_name, amount_owed, amount_paid, date, status) VALUES (?,?,?,?,?)",
+                              (cust, final_total, 0.0, today, "Unpaid"))
+                
+                # 3. Update Inventory (Subtract stock)
+                for i in st.session_state.basket:
+                    c.execute("UPDATE inventory SET stock_qty = stock_qty - ? WHERE item_name = ?", (i['qty'], i['name']))
+                
+                conn.commit()
+                conn.close()
+                
+                # 4. Generate Receipt
+                receipt_path = create_pdf_receipt(st.session_state.basket, final_total, st.session_state.username, cust)
+                st.success(f"Success! Final Total: ₦{final_total:,.2f}")
+                
+                with open(receipt_path, "rb") as f:
+                    st.download_button("🖨️ Click to Print Receipt", f, file_name=f"Aznan_Receipt_{cust}.pdf")
+                
+                # 5. Clear basket
+                st.session_state.basket = []
+                
+            if st.button("🗑️ Empty Basket"):
+                st.session_state.basket = []
+                st.rerun()
+        else:
+            st.info("The basket is empty. Add drugs from the left to start a sale.")
+
+    # --- Quick View Table ---
+    st.markdown("---")
+    st.subheader("📋 Last 5 Items Added")
+    conn = sqlite3.connect('aznan_step_by_step.db')
+    recent_df = pd.read_sql("SELECT item_name, stock_qty, retail_price, expiry_date FROM inventory ORDER BY id DESC LIMIT 5", conn)
+    st.table(recent_df)
+    conn.close()
+
+    # --- PAGE: EXPENSES ---
+elif choice == "💸 Expenses":
+    st.header("💸 Daily Expenses Log")
+    st.info("Record any business costs here. These will be subtracted from your Gross Profit on the Dashboard.")
+    
+    with st.form("expense_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            category = st.selectbox("Category", ["Staff Pay", "Fuel", "Electricity", "Shop Rent", "Repairs", "Others"])
+            amount = st.number_input("Amount (₦)", min_value=0.0, step=100.0)
+        with col2:
+            date_exp = st.date_input("Date of Expense", datetime.now())
+            note = st.text_input("Short Note (e.g., 'Fuel for Generator')")
+            
+        if st.form_submit_button("✅ Record Expense"):
+            if amount > 0:
+                conn = sqlite3.connect('aznan_step_by_step.db')
+                c = conn.cursor()
+                c.execute("INSERT INTO expenses (category, amount, date) VALUES (?, ?, ?)", 
+                          (category, amount, date_exp.strftime('%Y-%m-%d')))
+                conn.commit()
+                conn.close()
+                st.success(f"Successfully recorded ₦{amount:,.2f} for {category}")
+            else:
+                st.error("Please enter an amount greater than 0.")
+
+    # Show recent expenses
+    st.markdown("---")
+    st.subheader("📋 Recent Expenses")
+    conn = sqlite3.connect('aznan_step_by_step.db')
+    exp_df = pd.read_sql("SELECT category, amount, date FROM expenses ORDER BY id DESC LIMIT 10", conn)
+    if not exp_df.empty:
+        st.table(exp_df)
+    conn.close()
+
+elif choice == "📋 Inventory":
+    st.header("📋 Pharmacy Inventory Management")
+    conn = sqlite3.connect('aznan_step_by_step.db')
+    
+    # Fetch all data
+    df = pd.read_sql("SELECT * FROM inventory", conn)
+    
+    # Allow simple editing directly in the table
+    st.write("You can view and check your stock levels below:")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    
+    if st.button("🔄 Refresh Data"):
+        st.rerun()
+    conn.close()
+
+elif choice == "📦 Stock Addition":
+    st.header("📦 Supply Entry (Option A)")
+    st.info("Adding an existing item updates its prices.")
+
+    with st.form("stock_form", clear_on_submit=True):
+        name = st.text_input("Item Name").strip().upper()
+        col1, col2 = st.columns(2)
+        qty = col1.number_input("Quantity to Add", min_value=1)
+        unit = col2.selectbox("Unit", ["Single", "Card", "Sachet", "Bottle", "Box", "Pack"])
+        cost = col1.number_input("Cost Price (Each)", min_value=0.0)
+        retail = col2.number_input("Retail Price (Each)", min_value=0.0)
+        wholesale = col1.number_input("Wholesale Price (Each)", min_value=0.0)
+        expiry = col2.date_input("Expiry Date")
+
+        if st.form_submit_button("✅ Update Inventory"):
+            if name:
+                conn = sqlite3.connect('aznan_step_by_step.db')
+                c = conn.cursor()
+                c.execute("SELECT stock_qty FROM inventory WHERE item_name = ?", (name,))
+                existing = c.fetchone()
+                
+                if existing:
+                    new_qty = existing[0] + qty
+                    c.execute("""UPDATE inventory SET stock_qty=?, unit=?, cost_price=?, 
+                                 retail_price=?, wholesale_price=?, expiry_date=? WHERE item_name=?""",
+                              (new_qty, unit, cost, retail, wholesale, expiry.strftime('%Y-%m-%d'), name))
+                    st.success(f"Stock Updated! {name} now has {new_qty} units.")
+                else:
+                    c.execute("""INSERT INTO inventory (item_name, stock_qty, unit, cost_price, retail_price, wholesale_price, expiry_date) 
+                                 VALUES (?,?,?,?,?,?,?)""", (name, qty, unit, cost, retail, wholesale, expiry.strftime('%Y-%m-%d')))
+                    st.success(f"New Item {name} added to system.")
+                conn.commit(); conn.close()
+            else:
+                st.error("Please enter a name.")
+
+elif choice == "📉 Debt Tracker":
+    st.header("📉 Debt Collection")
+    conn = sqlite3.connect('aznan_step_by_step.db')
+    debts_df = pd.read_sql("SELECT * FROM debts WHERE status = 'Unpaid'", conn)
+    
+    if not debts_df.empty:
+        for idx, row in debts_df.iterrows():
+            remaining = row['amount_owed'] - row['amount_paid']
+            with st.expander(f"👤 {row['customer_name']} | Owed: ₦{remaining:,.2f}"):
+                pay_amt = st.number_input(f"Amount Paying", 0.0, float(remaining), key=f"d_{row['id']}")
+                if st.button("Confirm Payment", key=f"b_{row['id']}"):
+                    new_paid = row['amount_paid'] + pay_amt
+                    status = "Paid" if new_paid >= row['amount_owed'] else "Unpaid"
+                    # Update debt and record date so it shows on today's dashboard
+                    conn.execute("UPDATE debts SET amount_paid=?, status=?, date=? WHERE id=?", 
+                                 (new_paid, status, datetime.now().strftime('%Y-%m-%d'), row['id']))
+                    conn.commit(); st.rerun()
+    else:
+        st.success("No outstanding debts!")
+    conn.close()
+
+elif choice == "📅 Reports":
+    st.header("📅 Financial Reports")
+    mode = st.radio("Report Period", ["Daily", "Monthly"], horizontal=True)
+    conn = sqlite3.connect('aznan_step_by_step.db')
+    
+    if mode == "Daily":
+        target_date = st.date_input("Select Date").strftime('%Y-%m-%d')
+        df = pd.read_sql(f"SELECT * FROM sales WHERE date = '{target_date}'", conn)
+    else:
+        month = st.selectbox("Select Month", [f"{i:02d}" for i in range(1, 13)])
+        df = pd.read_sql(f"SELECT * FROM sales WHERE date LIKE '2026-{month}-%'", conn)
+    
+    if not df.empty:
+        st.write(f"### Total Revenue: ₦{df['total_revenue'].sum():,.2f}")
+        st.write(f"### Total Profit: ₦{df['total_profit'].sum():,.2f}")
+        st.dataframe(df, use_container_width=True)
+        
+        # Option to print report
+        csv = df.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Report as CSV", csv, "report.csv", "text/csv")
+    else:
+        st.warning("No data found for this period.")
+    conn.close()
+
